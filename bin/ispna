@@ -1,0 +1,312 @@
+#!/usr/bin/env raku
+
+use ISP::dsmadmc;
+use KHPH;
+use Terminal::ANSIColor;
+use Prettier::Table;
+use Data::Dump::Tree;
+#use Grammar::Debugger;
+#use Grammar::Tracer;
+
+constant    \QUERYSCHEDPERIOD   = 4;
+
+my %isp-servers;
+constant @redis-servers = <jgstmgtgate1lpv.wmata.local ctstmgtgate1lpv.wmata.local>;
+
+my @redis-clis;
+for @redis-servers -> $redis-server {
+    my @cmd-string = sprintf("ssh -L 127.0.0.1:6379:%s:6379 %s /usr/bin/redis-cli", $redis-server, $redis-server).split: /\s+/;
+    @redis-clis.push: @cmd-string;
+}
+
+for @redis-clis -> @redis-cli {
+    my @rcmd        = flat @redis-cli,
+                      '--raw',
+                      'KEYS',
+                      'eb:isp:servers:*';
+    my $proc        = run   @rcmd, :out, :err;
+    my $out         = $proc.out.slurp(:close);
+    my $err         = $proc.err.slurp(:close);
+    fail 'FAILED: ' ~ @rcmd ~ ":\t" ~ $err if $err;
+    if $out {
+        my @ispssks = $out.chomp.split("\n");
+        die "No ISP server site keys!" unless @ispssks;
+        @rcmd    = flat @redis-cli,
+                   '--raw',
+                   'SUNION',
+                   @ispssks;
+        $proc    = run   @rcmd, :out, :err;
+        $out     = $proc.out.slurp(:close);
+        $err     = $proc.err.slurp(:close);
+        fail 'FAILED: ' ~ @rcmd ~ ":\t" ~ $err if $err;
+        if $out {
+            %isp-servers = $out.chomp.split("\n").map: { $_ => 0 };
+            last;
+        }
+    }
+}
+
+sub MAIN (
+    Str:D   :$isp-node-name!,                   #= ISP client name (SELECT NODE_NAME FROM NODES)
+    Str:D   :$isp-server-current!,              #= ISP server "current home" name (SELECT SERVER_NAME FROM STATUS)
+    Str:D   :$isp-admin!,                       #= ISP server Admin account (CLASS=SYSTEM)
+) {
+
+################################################################################
+#   Sort out the ISP server info                                               #
+################################################################################
+
+    my $CURRENT_SERVER_NAME = $isp-server-current.uc;
+    unless %isp-servers{$CURRENT_SERVER_NAME}:exists {
+        $*ERR.put: colored('Unrecognized $isp-server-current <' ~ $isp-server-current ~ '> specified!', 'red');
+        die colored('Either fix your --$isp-server-current=<value> or update Redis eb:isp:servers:*', 'red');
+    }
+    die "Set up '/opt/tivoli/tsm/client/ba/bin/dsm.sys' & /usr/bin/dsmadmc on this host platform before using this script." unless '/opt/tivoli/tsm/client/ba/bin/dsm.sys'.IO.path:s;
+    my @dsm-sys     = slurp('/opt/tivoli/tsm/client/ba/bin/dsm.sys').lines;
+    my %stanzas;
+    my $current-key = 'ERROR';
+    for @dsm-sys -> $rcd {
+        if $rcd ~~ m:i/ ^ SERVERNAME \s+ <alnum>+? '_' $<server>=(<alnum>+) \s* $ / {
+            $current-key = $/<server>.Str;
+            next;
+        }
+        elsif $rcd ~~ m:i/ ^ \s* TCPS\w* \s+ $<value>=(.+) \s* $/ {
+            %stanzas{$current-key}<TCPSERVERADDRESS> = $/<value>.Str;
+        }
+    }
+    unless %stanzas{$CURRENT_SERVER_NAME}:exists {
+        warn "Use any of:"
+        .warn for %stanzas.keys;
+        die 'SERVERNAME stanza containing $isp-server-current <' ~ $CURRENT_SERVER_NAME ~ "> not found in '/opt/tivoli/tsm/client/ba/bin/dsm.sys'";
+    }
+
+################################################################################
+#   Sort out the ISP client (NODE) info                                        #
+################################################################################
+
+    my $PROPOSED_SERVER_NAME    = '';
+    my $NODE_NAME               = $isp-node-name.uc;
+
+    my ISP::dsmadmc $dsmadmc   .= new(:isp-server($CURRENT_SERVER_NAME), :$isp-admin);
+
+    my $node-info               = $dsmadmc.execute(['SELECT', 'NODE_NAME,SESSION_SECURITY,NODEGROUP', 'FROM', 'NODES', 'WHERE', 'NODE_NAME=' ~ q|'| ~ $NODE_NAME ~ q|'|]);
+    $NODE_NAME                  = $node-info[0]<NODE_NAME>          or die;
+    my $SESSION_SECURITY        = $node-info[0]<SESSION_SECURITY>   or die;
+    my $NODEGROUP               = $node-info[0]<NODEGROUP>          or die;
+
+#   select DOMAIN_NAME,SCHEDULE_NAME from ASSOCIATIONS where NODE_NAME='$NODE_NAME'
+    my $sched-info              = $dsmadmc.execute(['SELECT', 'DOMAIN_NAME,SCHEDULE_NAME', 'FROM', 'ASSOCIATIONS', 'WHERE', 'NODE_NAME=' ~ q|'| ~ $NODE_NAME ~ q|'|]);
+    my $DOMAIN_NAME             = $sched-info[0]<DOMAIN_NAME>   or die;
+    my $SCHEDULE_NAME           = $sched-info[0]<SCHEDULE_NAME> or die;
+#ddt $sched-info;
+
+#   select STARTTIME from CLIENT_SCHEDULES where DOMAIN_NAME='$DOMAIN_NAME' and SCHEDULE_NAME='$SCHEDULE_NAME'
+    my $starttime-info          = $dsmadmc.execute(['SELECT', 'STARTTIME', 'FROM', 'CLIENT_SCHEDULES', 'WHERE', 'DOMAIN_NAME=' ~ q|'| ~ $DOMAIN_NAME ~ q|'|, 'AND', 'SCHEDULE_NAME=' ~ q|'| ~ $SCHEDULE_NAME ~ q|'|]);
+#ddt $starttime-info;
+    my ($hour, $minute, $second);
+    ($hour, $minute, $second)   = $starttime-info[0]{'STARTTIME'}.split: ':';
+    my $start-dt                = DateTime.new(date => Date.today, :$hour, :$minute, :$second, :timezone($dsmadmc.seconds-offset-UTC));
+    $start-dt                   = DateTime.new(date => (Date.today + 1), :$hour, :$minute, :$second, :timezone($dsmadmc.seconds-offset-UTC)) if ($start-dt - now) <= 0;
+#put $start-dt ~ ' - ' ~ now.DateTime ~ ' = ' ~ ($start-dt - now);
+#
+#   - a value < (QUERYSCHEDPERIOD * 60 * 60) means the CA has to be recycled
+#   - otherwise, we're fine -- proceed
+#
+#put "if ($start-dt - DateTime.new(now)) " ~ ($start-dt - DateTime.new(now)) ~ ' < ' ~ (QUERYSCHEDPERIOD * 60 * 60);
+    if ($start-dt - DateTime.new(now)) < (QUERYSCHEDPERIOD * 60 * 60) {
+        $*ERR.put: colored('Remember to cycle the Client Acceptor because it may not refresh before the schedule is called!', 'red');
+        warn colored('Check to make sure their are no active SESSIONs for this NODE!', 'red');
+    }
+    else {
+#warn 'fine: ' ~ ($start-dt - DateTime.new(now));
+    }
+
+    my $replnode-info           = $dsmadmc.execute(['QUERY', 'REPLNODE', $NODE_NAME]);
+    for $replnode-info.list -> $rcd {
+        my $diff                = $rcd{'Objects on Source Replication Server'}.subst(',', :g) - $rcd{'Objects on Target Replication Server'}.subst(',', :g);
+        if $diff > 0 {
+            $*ERR.put: colored('Current replication source has ' ~ $diff ~ ' unreplicated objects pending!', 'white on_black');
+            warn colored('Finish replicating ' ~ $NODE_NAME ~ ' before continuing.', 'red');
+        }
+        $PROPOSED_SERVER_NAME   = $rcd{'Target Replication Server'};
+    }
+#ddt $replnode-info;
+#   QUERY REPLNODE $NODE_NAME
+#                              Node Name: C_DCI_UNIX_SUDO
+#                                   Type: Bkup
+#                         Filespace Name: /nfsmounts/C_DCI_UNIX_SUDO
+#                                   FSID: 1
+#   Objects on Source Replication Server: 36,369,138
+#   Objects on Target Replication Server: 36,369,138
+#              Target Replication Server: ISPLC01
+
+
+
+
+
+    my $table = Prettier::Table.new:
+        title => "IBM Spectrum Protect Configuration Topology Summary",
+        field-names => [
+            "NODE_NAME",
+            "DOMAIN_NAME",
+            "SCHEDULE_NAME",
+            "NODEGROUP",
+            "SESSION_SECURITY",
+            "Current ISP Server",
+            "Proposed ISP Server",
+        ],
+        align => %(
+            "NODE_NAME"             => 'c',
+            "DOMAIN_NAME"           => 'c',
+            "SCHEDULE_NAME"         => 'c',
+            "NODEGROUP"             => 'c',
+            "SESSION_SECURITY"      => 'c',
+            "Current ISP Server"    => 'c',
+            "Proposed ISP Server"   => 'c',
+        ),
+    ;
+
+    given $table {
+        .add-row: [
+                    $NODE_NAME,
+                    $DOMAIN_NAME,
+                    $SCHEDULE_NAME,
+                    $NODEGROUP,
+                    $SESSION_SECURITY,
+                    $CURRENT_SERVER_NAME,
+                    $PROPOSED_SERVER_NAME,
+                  ];
+    }
+    put $table;
+
+    put colored($PROPOSED_SERVER_NAME, 'white on_green');
+    put colored('UPDATE NODE '
+              ~ $NODE_NAME ~ ' '
+              ~ KHPH.new(:stash-path($*HOME ~ '/.' ~ $*PROGRAM-NAME.IO.basename ~ '/defaults/' ~ $CURRENT_SERVER_NAME ~ '/NODE/NODES.khph')).expose
+              ~ ' SESSIONSECURITY=TRANSITIONAL',
+                'green');
+    put colored('UNLOCK NODE ' ~ $NODE_NAME, 'green');
+    put colored('REMOVE REPLNODE '
+              ~ $NODE_NAME
+              ~ ' SERVER='
+              ~ $CURRENT_SERVER_NAME,
+                'green');
+    put colored('DEFINE ASSOCIATION '
+              ~ $DOMAIN_NAME
+              ~ ' '
+              ~ $SCHEDULE_NAME
+              ~ ' '
+              ~ $NODE_NAME,
+                'green');
+    put colored('DEFINE NODEGROUPMEMBER '
+              ~ $NODEGROUP
+              ~ ' '
+              ~ $NODE_NAME,
+                'green');
+    put colored('UPDATE NODE '
+              ~ $NODE_NAME
+              ~ ' '
+              ~ 'REPLSTATE=ENABLED'
+              ~ ' '
+              ~ 'REPLMODE=SYNCSEND',
+                'green');
+
+    put " ";
+
+    put colored($CURRENT_SERVER_NAME, 'white on_blue');
+    put colored('DELETE ASSOCIATION '
+              ~ $DOMAIN_NAME
+              ~ ' '
+              ~ $SCHEDULE_NAME
+              ~ ' '
+              ~ $NODE_NAME,
+                'blue');
+    put colored('DELETE NODEGROUPMEMBER '
+              ~ $NODEGROUP
+              ~ ' '
+              ~ $NODE_NAME,
+                'blue');
+    put colored('REMOVE REPLNODE '
+              ~ $NODE_NAME
+              ~ ' SERVER='
+              ~ $PROPOSED_SERVER_NAME,
+                'blue');
+    put colored('UPDATE NODE '
+              ~ $NODE_NAME
+              ~ ' '
+              ~ 'REPLSTATE=ENABLED'
+              ~ ' '
+              ~ 'REPLMODE=SYNCRECEIVE',
+                'blue');
+}
+=finish
+
+
+#   - get the NODE in question
+#       - get NODEGROUPs
+#       - get ASSOCIATIONs
+#           - if next job is less than 4 hours (QUERYSCHEDPERIOD), warn and advise that manual CA restart is required afterward
+#       - check REPLNODE
+#           - if STGRULE hasn't finished replication fully, report and terminate
+#       - determine current home and proposed home
+
+
+********************************************************************************
+********************************************************************************
+********************************************************************************
+no active sesssions
+no imminent or active REPLICATION
+********************************************************************************
+********************************************************************************
+********************************************************************************
+
+
+
+#   - ask the user if they want to switch
+#   - lc01 UPDATE NODE P_FCS_WAS xxxxxxxx SESSIONSECURITY=TRANSITIONAL
+#   - lc01 UNLOCK NODE P_FCS_WAS
+#   - lc01 REMOVE REPLNODE P_FCS_WAS SERVER=ISPLC02 
+#   - lc01 DEFINE ASSOCIATION NFS SCH_2300 P_FCS_WAS 
+#   - lc01 DEFINE NODEGROUPMEMBER NFS P_FCS_WAS 
+#   - lc01 UPDATE NODE P_FCS_WAS REPLSTATE=ENABLED REPLMODE=SYNCSEND 
+
+#   - lc02 DELETE ASSOCIATION NFS SCH_2300 P_FCS_WAS 
+#   - lc02 DELETE NODEGROUPMEMBER NFS P_FCS_WAS 
+#   - lc02 REMOVE REPLNODE P_FCS_WAS SERVER=ISPLC01 
+#   - lc02 UPDATE NODE P_FCS_WAS REPLSTATE=ENABLED REPLMODE=SYNCRECEIVE
+
+
+
+    if $node-info[0]<NODE_NAME> {
+        colored('DEFINE CLOPTSET ' ~ $NODE_NAME, 'white on_black').put unless $OPTION_SET eq $NODE_NAME;
+        colored('UPDATE NODE ' ~ $NODE_NAME ~ ' SESSIONSECURITY=TRANSITIONAL', 'white on_black').put unless $SESSION_SECURITY eq 'Transitional';
+        colored('DEFINE NODEGROUPMEMBER %%% ' ~ $NODE_NAME ~ ' /* optional */', 'white on_black').put unless $NODEGROUP;
+    }
+    else {
+        colored('DEFINE CLOPTSET ' ~ $NODE_NAME, 'white on_black').put unless $OPTION_SET && $OPTION_SET eq $NODE_NAME;
+        colored('REGISTER NODE '
+                ~ $NODE_NAME
+                ~ ' '
+                ~ KHPH.new(:stash-path($*HOME ~ '/.' ~ $*PROGRAM-NAME.IO.basename ~ '/defaults/' ~ $CURRENT_SERVER_NAME ~ '/NODE/password.khph')).expose
+                ~ ' '
+                ~ 'DOMAIN=%%%'
+                ~ ' '
+                ~ 'USER=NONE'
+                ~ ' '
+                ~ 'MAXNUMMP=5'
+                ~ ' '
+                ~ 'CONTACT="L%%%, F%%%%"'
+                ~ ' '
+                ~ 'EMAILADDRESS=%%%@%%%.%%%'
+                ~ ' '
+                ~ 'CLO=' ~ $NODE_NAME
+                ~ ' '
+                ~ 'REPLSTATE=ENABLED'
+                ~ ' '
+                ~ 'SESSIONSECURITY=TRANSITIONAL', 'white on_black').put;
+        colored('DEFINE NODEGROUPMEMBER %%% ' ~ $NODE_NAME ~ ' /* optional */', 'white on_black').put unless $NODEGROUP;
+        exit 1;
+    }
+}
+
+=finish
