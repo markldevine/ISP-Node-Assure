@@ -1,6 +1,6 @@
 ISP Node Assure
 ===============
-This script checks site policy of ISP NODEs and recommends actions to remedy.
+This script checks site policy of ISP NODEs and recommends actions.
 
 SYNOPSIS
 ========
