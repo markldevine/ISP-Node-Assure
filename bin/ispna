@@ -31,8 +31,9 @@ sub MAIN (
 #   Str:D   :$isp-node-name!,                   #= ISP client name (SELECT NODE_NAME FROM NODES)
     Str:D   :$isp-server!,                      #= ISP server name (SELECT SERVER_NAME FROM STATUS)
     Str:D   :$isp-admin!,                       #= ISP server Admin account
+    Bool    :$cache                             #= Read from cache
 ) {
-    my ISP::dsmadmc $dsmadmc   .= new(:$isp-server, :$isp-admin);
+    my ISP::dsmadmc $dsmadmc   .= new(:$isp-server, :$isp-admin, :$cache);
 
 #   my $node-info               = $dsmadmc.execute(['SELECT', 'NODE_NAME,SESSION_SECURITY,NODEGROUP', 'FROM', 'NODES', 'WHERE', 'NODE_NAME=' ~ q|'| ~ $NODE_NAME ~ q|'|]);
     for $dsmadmc.execute(['SELECT', 'NODE_NAME,CONTACT,EMAIL_ADDRESS,LAST_REPLICATED_TO_SERVER,LOCKED,NODEGROUP,REPLICATION_PRIMARY_SERVER', 'FROM', 'NODES']) -> $node-record {
